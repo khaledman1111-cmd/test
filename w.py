@@ -24,8 +24,8 @@ BASE_QUOTE = "USDT"
 INTERVAL = "1h"
 KLINE_LIMIT = 300
 MIN_QUOTE_VOLUME = CONFIG.get("min_trade_usd", 1000.0)
-SCAN_PAUSE_SEC = CONFIG.get("scan_interval_min", 15) * 60  # ربع ساعة (15 دقيقة)
-POSITION_SIZE = 500.0  # المبلغ لكل صفقة
+SCAN_PAUSE_SEC = CONFIG.get("scan_interval_min", 15) * 60  # كل ربع ساعة
+POSITION_SIZE = 500.0  # $500 لكل صفقة
 LIQ_WINDOW_SEC = 12 * 3600  # 12 ساعة
 NET_LIQ_THRESHOLD = 20000
 
@@ -100,38 +100,21 @@ def print_entry_exit(symbol, entry, stop, target):
     print(f"🔸 أخذ الربح:   {target:.6f}")
     print(f"🔸 مقدار الحركة للوقف/الهدف: 3%")
 
-def place_stop_loss(symbol, qty, stop_price):
-    # Limit price يجب أن يكون أقل قليلاً من stop_price للتنفيذ المضمون
-    limit_price = stop_price * 0.9995
+def place_oco_order(symbol, qty, target_price, stop_price, stop_limit_price):
     try:
-        order = client.create_order(
+        order = client.create_oco_order(
             symbol=symbol,
             side='SELL',
-            type='STOP_LOSS_LIMIT',
             quantity=qty,
-            price=f"{limit_price:.6f}",
-            stopPrice=f"{stop_price:.6f}",
-            timeInForce='GTC'
+            price=f"{target_price:.6f}",              # هدف الربح
+            stopPrice=f"{stop_price:.6f}",            # سعر التريجر للستوب
+            stopLimitPrice=f"{stop_limit_price:.6f}", # سعر الحد النهائي للستوب
+            stopLimitTimeInForce='GTC'
         )
-        print(f"✅ وضع أمر وقف خسارة على {stop_price:.6f} ({symbol})")
+        print(f"✅ تم وضع أمر OCO({symbol}): هدف {target_price:.6f} - ستوب {stop_price:.6f}")
         return order
     except Exception as e:
-        print(f"❌ فشل وضع أمر وقف الخسارة: {e}")
-
-def place_take_profit(symbol, qty, target_price):
-    try:
-        order = client.create_order(
-            symbol=symbol,
-            side='SELL',
-            type='LIMIT',
-            quantity=qty,
-            price=f"{target_price:.6f}",
-            timeInForce='GTC'
-        )
-        print(f"✅ وضع أمر أخذ ربح على {target_price:.6f} ({symbol})")
-        return order
-    except Exception as e:
-        print(f"❌ فشل وضع أمر أخذ الربح: {e}")
+        print(f"❌ فشل وضع أمر OCO: {e}")
 
 def execute_order(symbol, entry_price):
     min_qty, step_size = get_lot_size(symbol)
@@ -149,15 +132,15 @@ def execute_order(symbol, entry_price):
             quantity=qty
         )
         print("✅ تم تنفيذ الشراء بنجاح!")
-
-        # حساب الهدف والوقف حسب مواصفاتك (+3% و -3%)
+        # حساب الأسعار المطلوبة
         stop_loss = entry_price * 0.97
+        stop_limit_price = stop_loss * 0.9995
         take_profit = entry_price * 1.03
+
         print_entry_exit(symbol, entry_price, stop_loss, take_profit)
 
-        # ضع أوامر البيع مباشرة بعد الشراء
-        place_stop_loss(symbol, qty, stop_loss)
-        place_take_profit(symbol, qty, take_profit)
+        # أمر بيع OCO مباشر (هدف + ستوب)
+        place_oco_order(symbol, qty, take_profit, stop_loss, stop_limit_price)
     except Exception as e:
         print(f"❌ خطأ في تنفيذ صفقة الشراء: {e}")
 
