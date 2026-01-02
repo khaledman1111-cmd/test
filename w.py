@@ -4,13 +4,20 @@ from advanced_crypto_screener2 import analyze_market, apply_ruleA
 import websocket
 import yaml
 
-# === تحميل الإعدادات من config.yaml ===
+# ============ إعداد بينانس =============
+from binance.client import Client
+
+# ضع مفاتيحك هنا (أو من متغيرات البيئة)
+api_key = "m1kAKxSjneF1IX4OZyfQ9T8TNQPq2tjUni4GWSh21Qmrmm5BE356aInNUPymR2fvM"
+api_secret = "H150REzfK3mecvbt3JkuFOPMpNfyuvkjtbOTSa1eGFILI1vBYIi4UnnizatMp58Lu"
+client = Client(api_key, api_secret, testnet=False)  # تأكد testnet=False للحساب الحقيقي
+
+# ==== إعدادات من config.yaml ====
 def load_config(config_path="config.yaml"):
     with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 CONFIG = load_config("config.yaml")
-
 WHITELIST = [s.upper() for s in CONFIG.get("whitelist", [])]
 BASE_QUOTE = "USDT"
 INTERVAL = "1h"
@@ -18,14 +25,11 @@ KLINE_LIMIT = 300
 MIN_QUOTE_VOLUME = CONFIG.get("min_trade_usd", 1000.0)
 SCAN_PAUSE_SEC = CONFIG.get("scan_interval_min", 30) * 60
 POSITION_SIZE = CONFIG.get("position_size_usd", 50.0)
+LIQ_WINDOW_SEC = 12 * 3600  # 12 ساعة
+NET_LIQ_THRESHOLD = 20000   # عدلها حسب السيولة المطلوبة
 
-# == سيولة لحظية ==
-LIQ_WINDOW_SEC = 12 * 3600  # 12 ساعة (43200 ثانية)
-NET_LIQ_THRESHOLD = 20000   # عدله حسب قوة السيولة المطلوبة للصفقة
-
-# Binance AggTrade Websocket
 SYMBOLS = WHITELIST
-THRESHOLD = 1000  # يصير trx بقيمة فوق الألف دولار
+THRESHOLD = 1000
 data = defaultdict(lambda: {"b":0.0,"s":0.0,"dq":deque()})
 lock = threading.Lock()
 
@@ -74,6 +78,21 @@ def print_entry_exit(row):
     print(f"🔸 أخذ الربح:   {target_1:.6f}")
     print(f"🔸 نسبة RR:     {rr_t1}")
 
+def execute_order(symbol, price, position_size_usd):
+    # حساب كمية العملة حسب السعر
+    quantity = round(position_size_usd / price, 3)
+    print(f"🔺 تنفيذ صفقة شراء حقيقة على {symbol} بكمية {quantity} ({position_size_usd}$)")
+    try:
+        order = client.create_order(
+            symbol=symbol,
+            side="BUY",
+            type="MARKET",
+            quantity=quantity
+        )
+        print("✅ تم تنفيذ الصفقة!", order)
+    except Exception as e:
+        print(f"❌ خطأ في تنفيذ الصفقة: {e}")
+
 def scanner_loop():
     while True:
         print('\n⏳ سكان عملات (كل نص ساعة)...')
@@ -106,11 +125,11 @@ def scanner_loop():
             net_liq = get_net_liq(symbol)
             print(f"- {symbol} | net_liq = {net_liq:,.0f}")
             if net_liq > NET_LIQ_THRESHOLD:
-                print(f"✅ دخول على {symbol} .. net_liq قوي!")
+                print(f"✅ دخول حقيقي على {symbol} .. net_liq قوي!")
                 print_entry_exit(row)
                 print(f"🔺 حجم الصفقة: {POSITION_SIZE}$")
-                # مكان التنفيذ الفعلي للشراء أو الإشارة
-                break  # لا تدخل أكثر من عملة بنفس اللحظة (احذف break لو تريد الدخول بأكثر من واحدة)
+                execute_order(symbol, row['price'], POSITION_SIZE)
+                break
             else:
                 print(f"🚫 net_liq غير كافي ({net_liq:,.0f}) للعملة {symbol}")
 
