@@ -1,4 +1,6 @@
-import time, threading, json
+import time
+import threading
+import json
 from collections import defaultdict, deque
 import websocket
 import yaml
@@ -7,7 +9,7 @@ from binance.client import Client
 from dotenv import load_dotenv
 from advanced_crypto_screener2 import analyze_market, apply_ruleA
 
-# تحميل مفاتيح Binance من .env
+# تحميل المفاتيح من .env
 load_dotenv()
 api_key = os.getenv("BINANCE_API_KEY")
 api_secret = os.getenv("BINANCE_API_SECRET")
@@ -25,9 +27,12 @@ INTERVAL = "1h"
 KLINE_LIMIT = 300
 MIN_QUOTE_VOLUME = CONFIG.get("min_trade_usd", 1000.0)
 SCAN_PAUSE_SEC = CONFIG.get("scan_interval_min", 15) * 60  # كل ربع ساعة
-POSITION_SIZE = 500.0  # $500 لكل صفقة
+
+POSITION_SIZE = CONFIG.get("position_size_usd", 500.0)  # مبلغ الصفقة من الكونفج
+STOP_LOSS_PCT = CONFIG.get("sl_pct", 0.05)   # نسبة وقف الخسارة (5%) من الكونفج
+
 LIQ_WINDOW_SEC = 12 * 3600  # 12 ساعة
-NET_LIQ_THRESHOLD = 20000
+NET_LIQ_THRESHOLD = CONFIG.get("min_net_usd", 10000)
 
 SYMBOLS = WHITELIST
 THRESHOLD = 1000
@@ -93,28 +98,29 @@ def get_net_liq(sym):
         d = data.get(sym, {})
         return d.get("b", 0) - d.get("s", 0)
 
-def print_entry_exit(symbol, entry, stop, target):
+def print_entry_exit(symbol, entry, stop):
     print(f"🔹 عملة: {symbol}")
     print(f"🔸 نقطة الدخول: {entry:.6f}")
     print(f"🔸 وقف الخسارة: {stop:.6f}")
-    print(f"🔸 أخذ الربح:   {target:.6f}")
-    print(f"🔸 مقدار الحركة للوقف/الهدف: 3%")
+    print(f"🔸 مقدار الحركة للوقف: {STOP_LOSS_PCT*100:.1f}%")
 
-def place_oco_order(symbol, qty, target_price, stop_price, stop_limit_price):
+def place_stop_limit_order(symbol, qty, stop_price, limit_price, precision_price):
     try:
-        order = client.create_oco_order(
+        order = client.create_order(
             symbol=symbol,
             side='SELL',
+            type='STOP_LOSS_LIMIT',
             quantity=qty,
-            price=f"{target_price:.6f}",              # هدف الربح
-            stopPrice=f"{stop_price:.6f}",            # سعر التريجر للستوب
-            stopLimitPrice=f"{stop_limit_price:.6f}", # سعر الحد النهائي للستوب
-            stopLimitTimeInForce='GTC'
+            price=f"{limit_price:.{precision_price}f}",
+            stopPrice=f"{stop_price:.{precision_price}f}",
+            timeInForce='GTC'
         )
-        print(f"✅ تم وضع أمر OCO({symbol}): هدف {target_price:.6f} - ستوب {stop_price:.6f}")
+        print(f"✅ أمر ستوب-ليميت على {symbol} تم بنجاح")
         return order
     except Exception as e:
-        print(f"❌ فشل وضع أمر OCO: {e}")
+        print(f"⚠️ فشل أمر ستوب-ليميت: {e}")
+        with open("failed_sell_orders.log", "a") as f:
+            f.write(f"{time.ctime()} - STOP LIMIT FAIL - {symbol}: qty={qty}, error={e}\n")
 
 def execute_order(symbol, entry_price):
     min_qty, step_size = get_lot_size(symbol)
@@ -123,29 +129,67 @@ def execute_order(symbol, entry_price):
     if qty < min_qty:
         print(f"❌ الكمية ({qty}) أقل من الحد الأدنى {min_qty} للشراء في {symbol}. الصفقة مهملة!")
         return
-    print(f"🔺 تنفيذ صفقة شراء على {symbol} (${POSITION_SIZE}) بكمية {qty}")
+    print(f"🔺 شراء على {symbol} (${POSITION_SIZE}) بكمية {qty}")
     try:
-        order = client.create_order(
+        buy_order = client.create_order(
             symbol=symbol,
             side="BUY",
             type="MARKET",
             quantity=qty
         )
-        print("✅ تم تنفيذ الشراء بنجاح!")
-        # حساب الأسعار المطلوبة
-        stop_loss = entry_price * 0.97
+        print("✅ شراء العملة بنجاح!")
+
+        # انتظر لترحيل الرصيد
+        time.sleep(2)
+        base_asset = client.get_symbol_info(symbol)['baseAsset']
+        account_balance = client.get_asset_balance(asset=base_asset)
+        real_qty = float(account_balance['free'])
+        real_qty = (real_qty // step_size) * step_size
+        real_qty = float(format(real_qty, f".{abs(str(step_size)[::-1].find('.'))}f"))
+
+        print(f"➡️ الرصيد الفعلي بعد الشراء: {real_qty}, الحد الأدنى للتداول: {min_qty}")
+
+        if real_qty < min_qty:
+            print(f"⚠️ الرصيد ({real_qty}) أقل من الحد الأدنى ({min_qty}) ولن يتم وضع أمر بيع.")
+            with open("failed_sell_orders.log", "a") as f:
+                f.write(f"{time.ctime()} - SELL SKIPPED - {symbol}: qty={real_qty}, min_qty={min_qty}\n")
+            return
+
+        # وقف الخسارة عند 5%
+        stop_loss = entry_price * (1-STOP_LOSS_PCT)
         stop_limit_price = stop_loss * 0.9995
-        take_profit = entry_price * 1.03
 
-        print_entry_exit(symbol, entry_price, stop_loss, take_profit)
+        info = client.get_symbol_info(symbol)
+        price_tick = [float(f['tickSize']) for f in info['filters'] if f['filterType']=='PRICE_FILTER'][0]
+        precision_price = abs(str(price_tick)[::-1].find('.'))
 
-        # أمر بيع OCO مباشر (هدف + ستوب)
-        place_oco_order(symbol, qty, take_profit, stop_loss, stop_limit_price)
+        stop_loss = float(format(stop_loss, f".{precision_price}f"))
+        stop_limit_price = float(format(stop_limit_price, f".{precision_price}f"))
+
+        if stop_loss <= stop_limit_price:
+            stop_limit_price = stop_loss - price_tick
+            stop_limit_price = float(format(stop_limit_price, f".{precision_price}f"))
+            if stop_limit_price <= 0:
+                print(f"⚠️ stop_limit_price صغير جداً في {symbol}. لن يتم وضع أمر بيع.")
+                with open("failed_sell_orders.log", "a") as f:
+                    f.write(f"{time.ctime()} - STOPLIMIT_LOW - {symbol}: stop_limit_price={stop_limit_price}\n")
+                return
+
+        print_entry_exit(symbol, entry_price, stop_loss)
+
+        # أمر ستوب لوز فقط
+        try:
+            place_stop_limit_order(symbol, real_qty, stop_loss, stop_limit_price, precision_price)
+        except Exception as e:
+            print(f"⚠️ لم يتم وضع أمر البيع! {e}. السكربت سيستمر...")
+            with open("failed_sell_orders.log", "a") as f:
+                f.write(f"{time.ctime()} - STOPLIMIT SELL ERROR - {symbol}: qty={real_qty}, error={e}\n")
     except Exception as e:
-        print(f"❌ خطأ في تنفيذ صفقة الشراء: {e}")
+        print(f"⚠️ خطأ بالشراء أو أثناء التنفيذ {e}. السكربت سيكمل العمل بشكل طبيعي.")
+        with open("failed_sell_orders.log", "a") as f:
+            f.write(f"{time.ctime()} - BUY ERROR - {symbol}: error={e}\n")
 
 def cleanup_entered_symbols():
-    """تنظيف العملات المدخولة قبل 12 ساعة."""
     now = time.time()
     to_del = [sym for sym, t in entered_symbols.items() if now - t > LIQ_WINDOW_SEC]
     for sym in to_del:
@@ -154,16 +198,22 @@ def cleanup_entered_symbols():
 def scanner_loop():
     while True:
         print('\n⏳ سكان عملات (كل ربع ساعة)...')
-        df_scan = analyze_market(
-            base_quote=BASE_QUOTE,
-            interval=INTERVAL,
-            kline_limit=KLINE_LIMIT,
-            min_quote_volume=MIN_QUOTE_VOLUME,
-            max_symbols=len(WHITELIST),
-            top_n=None,
-            mode="fast"
-        )
-        cleanup_entered_symbols()  # تنظيف العملات القديمة من الدخولات السابقة
+        try:
+            df_scan = analyze_market(
+                base_quote=BASE_QUOTE,
+                interval=INTERVAL,
+                kline_limit=KLINE_LIMIT,
+                min_quote_volume=MIN_QUOTE_VOLUME,
+                max_symbols=len(WHITELIST),
+                top_n=None,
+                mode="fast"
+            )
+        except Exception as e:
+            print(f"⚠️ تحليل السوق فشل: {e}. ننتظر الدورة التالية.")
+            time.sleep(SCAN_PAUSE_SEC)
+            continue
+
+        cleanup_entered_symbols()
 
         if df_scan.empty:
             print("❌ سكان فارغ!")
